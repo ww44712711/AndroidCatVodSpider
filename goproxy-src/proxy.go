@@ -156,9 +156,12 @@ func (p *Player) Play(w http.ResponseWriter, ctx context.Context) error {
 		done[i] = make(chan struct{})
 	}
 
-	// 预取窗口：最多领先 writer 这么多块，避免把整个窗口全读进内存。
-	// thread 个在途 + 一点缓冲，内存占用约 (thread+4)×chunkSize。
-	lead := p.thread + 4
+	// 预取窗口：最多领先 writer 这么多块。
+	//
+	// 必须 >= thread，否则线程抢不到活干就空转 ——
+	// 链池调大到 16 条、thread=32 后这点尤其关键。
+	// 内存占用约 lead × chunkSize，32+8 块 × 1MB = 40MB，可接受。
+	lead := p.thread + 8
 
 	fetchCtx, cancelFetch := context.WithCancel(ctx)
 	defer cancelFetch()
