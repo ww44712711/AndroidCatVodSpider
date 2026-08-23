@@ -1,5 +1,5 @@
 {
-  "spider": "https://android.lushunming.qzz.io/jar/custom_spider.jar;md5;e0219b313d1ae065d57b1a12d8f528bc",
+  "spider": "https://raw.githubusercontent.com/ww44712711/AndroidCatVodSpider/multiThread/jar/custom_spider.jar;md5;e0219b313d1ae065d57b1a12d8f528bc",
   "lives": [
     {
       "name": "电视直播",
@@ -35,6 +35,15 @@
     }
   ],
   "sites": [
+    {
+      "key": "JuXiaFan4K",
+      "name": "剧下饭4K",
+      "type": 3,
+      "api": "csp_JuXiaFan4K",
+      "searchable": 1,
+      "filterable": 1,
+      "changeable": 0
+    },
     {
       "key": "Introduce",
       "name": "Cookie设置",
