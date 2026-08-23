@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -67,10 +66,10 @@ func NewPlayer(header http.Header, thread, chunkSizeKB int, url string, perURL i
 				IdleConnTimeout:       60 * time.Second,
 				ResponseHeaderTimeout: 30 * time.Second,
 				DisableKeepAlives:     false,
-				DialContext: (&net.Dialer{
-					Timeout:   10 * time.Second,
-					KeepAlive: 30 * time.Second,
-				}).DialContext,
+				// 用自定义 DNS 解析：Android 没有 /etc/resolv.conf，
+				// 纯 Go 解析器会回落到 localhost:53 并失败
+				// (lookup xxx on [::1]:53: connection refused)。
+				DialContext: dialContext,
 			},
 		},
 		header:    h,
