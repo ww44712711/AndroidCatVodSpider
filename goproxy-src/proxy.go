@@ -224,11 +224,33 @@ func (p *Player) downloadFirst(w http.ResponseWriter, ctx context.Context) (int6
 
 	h := w.Header()
 	h.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, totalLength))
+
+	// 只透传对播放有意义的头。
+	// 关键：绝不能把源站的 Connection / Content-Length / Transfer-Encoding 抄过来。
+	// 光鸭 CDN 每个分块响应都带 Connection: close，抄过去会让播放器在
+	// 收完第一块（约 1MB）后就断开，于是只拿到文件开头一小段，
+	// ExoPlayer 报 ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED（容器无法解析）。
+	// 这类逐跳头（hop-by-hop）本来就不该被代理转发。
+	skip := map[string]bool{
+		"Content-Range":       true,
+		"Content-Length":      true,
+		"Connection":          true,
+		"Transfer-Encoding":   true,
+		"Keep-Alive":          true,
+		"Proxy-Connection":    true,
+		"Trailer":             true,
+		"Upgrade":             true,
+		"Te":                  true,
+		"Content-Disposition": true, // 带 attachment 会让某些播放器当下载处理
+	}
 	for k, v := range header {
-		if k != "Content-Range" && k != "Content-Length" {
+		if !skip[http.CanonicalHeaderKey(k)] {
 			h[k] = v
 		}
 	}
+	// 明确告知总长与可 Range，播放器据此做 seek
+	h.Set("Accept-Ranges", "bytes")
+	h.Set("Content-Length", strconv.FormatInt(end-start+1, 10))
 	w.WriteHeader(status)
 
 	_, err = w.Write(chunk)
