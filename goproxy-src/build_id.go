@@ -8,4 +8,4 @@ package main
 // 所以让二进制通过 /health 自报 build，Java 侧比对不一致就调 /quit 让它退出。
 //
 // 每次改动 Go 代码都要更新这个值。
-const BuildID = "2026082303-stream"
+const BuildID = "2026082304-ramp"

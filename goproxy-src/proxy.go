@@ -115,17 +115,34 @@ func (p *Player) Play(w http.ResponseWriter, ctx context.Context) error {
 	// 且慢块只阻塞它自己那个位置，不会拖住整批。
 	// 内置 Java 代理就是这个设计，实测能稳定播放。
 
-	// 切片
+	// 切片。
+	//
+	// 关键：writer 严格按序，必须等 idx=0 就绪才能写第一个字节。
+	// 若首块就用满 chunkSize(1MB)，光鸭单链限速下要 4~5 秒才下完，
+	// 这段时间播放器一个字节都拿不到 —— 实测头 5.2 秒只交付 0.25MB，
+	// 播放器 3.4 秒就判超时失败。
+	// 所以开头用递增的小分片（64KB 起，逐步翻倍到 chunkSize）：
+	// 第一片几百毫秒就能就绪，让数据尽快流动起来；
+	// 后面再用大分片保证吞吐。
 	type piece struct {
 		start, end int64 // [start, end)
 	}
 	var pieces []piece
-	for off := s; off < windowEnd; off += p.chunkSize {
-		end := off + p.chunkSize
+	ramp := int64(64 * 1024)
+	for off := s; off < windowEnd; {
+		size := ramp
+		if size > p.chunkSize {
+			size = p.chunkSize
+		}
+		end := off + size
 		if end > windowEnd {
 			end = windowEnd
 		}
 		pieces = append(pieces, piece{off, end})
+		off = end
+		if ramp < p.chunkSize {
+			ramp *= 2
+		}
 	}
 
 	total := len(pieces)
