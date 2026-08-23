@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -99,98 +100,151 @@ func (p *Player) Play(w http.ResponseWriter, ctx context.Context) error {
 		flusher.Flush()
 	}
 
-	results := make([][]byte, p.thread)
-	var wg sync.WaitGroup
+	if s >= windowEnd {
+		return nil
+	}
 
-	for start := s; start < windowEnd; start += int64(p.chunkSize) * int64(p.thread) {
-		// 上层如果主动断开连接，这里尽快停止后续下载。
-		select {
-		case <-ctx.Done():
-			log.Printf("请求被取消")
-			return ctx.Err()
-		default:
+	// ============ 流式写出 ============
+	//
+	// 原实现是「批量」：一轮起 thread 个分块，wg.Wait() 等**全部**完成后才按序写出。
+	// 一轮就是 thread × chunkSize（8×1MB=8MB），光鸭限速下要等很久才凑齐一轮，
+	// 首字节延迟实测 7~9 秒，ExoPlayer 早已超时判失败 —— 表现就是「一点速度都没有」。
+	//
+	// 改为流水线：worker 持续并发预取后面的分块，writer 只要「下一个该写的」就绪
+	// 就立刻写出并 Flush，不等同批其它分块。这样首字节 ≈ 单块耗时，
+	// 且慢块只阻塞它自己那个位置，不会拖住整批。
+	// 内置 Java 代理就是这个设计，实测能稳定播放。
+
+	// 切片
+	type piece struct {
+		start, end int64 // [start, end)
+	}
+	var pieces []piece
+	for off := s; off < windowEnd; off += p.chunkSize {
+		end := off + p.chunkSize
+		if end > windowEnd {
+			end = windowEnd
 		}
+		pieces = append(pieces, piece{off, end})
+	}
 
-		activeThreads := 0
-		// 每一轮批量并发下载都记录各自的错误，便于统一判断是否中断传输。
-		chunkErrors := make([]error, p.thread)
+	total := len(pieces)
+	// 每个分块一个就绪信号 + 数据槽
+	results := make([][]byte, total)
+	errs := make([]error, total)
+	done := make([]chan struct{}, total)
+	for i := range done {
+		done[i] = make(chan struct{})
+	}
 
-		for i := 0; i < p.thread; i++ {
-			chunkStart := start + int64(i)*p.chunkSize
-			chunkEnd := chunkStart + p.chunkSize
-			if chunkStart >= windowEnd {
-				break
-			}
-			if chunkEnd > windowEnd {
-				chunkEnd = windowEnd
-			}
+	// 预取窗口：最多领先 writer 这么多块，避免把整个窗口全读进内存。
+	// thread 个在途 + 一点缓冲，内存占用约 (thread+4)×chunkSize。
+	lead := p.thread + 4
 
-			results[i] = nil
-			chunkErrors[i] = nil
-			activeThreads++
-			wg.Add(1)
+	fetchCtx, cancelFetch := context.WithCancel(ctx)
+	defer cancelFetch()
 
-			go func(idx int, cs, ce int64) {
-				defer wg.Done()
+	// 写到哪一块了，worker 据此控制预取距离
+	var writeCursor int64
+	var next int64 // 下一个待领取的分块索引
 
-				// 单个分块设置独立超时，避免某一块永久卡住拖死整轮任务。
-				downloadCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-				defer cancel()
+	var wg sync.WaitGroup
+	for i := 0; i < p.thread; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				idx := int(atomic.AddInt64(&next, 1) - 1)
+				if idx >= total {
+					return
+				}
+				// 别跑太远，等 writer 追上来再继续
+				for atomic.LoadInt64(&writeCursor)+int64(lead) < int64(idx) {
+					select {
+					case <-fetchCtx.Done():
+						close(done[idx])
+						return
+					case <-time.After(30 * time.Millisecond):
+					}
+				}
+				select {
+				case <-fetchCtx.Done():
+					close(done[idx])
+					return
+				default:
+				}
 
-				// 每个分块独立重试，提高弱网或不稳定源站下的成功率。
+				pc := pieces[idx]
 				var data []byte
 				var err error
+				// 每块独立超时，避免某块永久卡住
 				for retry := 0; retry < 3; retry++ {
-					data, _, _, err = p.downloadChunk(downloadCtx, cs, ce, 3)
+					dlCtx, cancel := context.WithTimeout(fetchCtx, 60*time.Second)
+					data, _, _, err = p.downloadChunk(dlCtx, pc.start, pc.end, 3)
+					cancel()
 					if err == nil {
 						break
 					}
-					log.Printf("块 %d-%d 第%d次重试", cs, ce-1, retry+1)
-					time.Sleep(time.Second * time.Duration(retry+1))
+					if fetchCtx.Err() != nil {
+						break
+					}
+					log.Printf("块 %d-%d 第%d次重试", pc.start, pc.end-1, retry+1)
+					select {
+					case <-time.After(time.Duration(retry+1) * 500 * time.Millisecond):
+					case <-fetchCtx.Done():
+					}
 				}
-
 				if err != nil {
-					log.Printf("⚠️ 块 %d-%d 下载彻底失败: %v", cs, ce-1, err)
-					// 记录失败块，后面由主协程统一决定是否终止本次传输。
-					chunkErrors[idx] = fmt.Errorf("数据块 %d (%d-%d) 下载失败: %w", idx, cs, ce-1, err)
-					return
+					errs[idx] = fmt.Errorf("数据块 %d (%d-%d) 下载失败: %w", idx, pc.start, pc.end-1, err)
+				} else {
+					results[idx] = data
 				}
-				results[idx] = data
-			}(i, chunkStart, chunkEnd)
-		}
-
-		// 当前这批块必须全部结束后，才能按顺序向客户端写出。
-		wg.Wait()
-
-		// 只要某块彻底失败，就直接中止，避免客户端拿到拼接不完整的数据流。
-		for i := 0; i < activeThreads; i++ {
-			if chunkErrors[i] != nil {
-				log.Printf("❌ %v", chunkErrors[i])
-				return chunkErrors[i] // 中止传输，不返回异常数据流
+				close(done[idx])
 			}
-		}
-
-		// 等待批量任务结束后再次确认调用方是否已经取消。
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		// 下载顺序可以并发，写出顺序必须稳定，否则客户端数据会错位。
-		for i := 0; i < activeThreads; i++ {
-			_, err = w.Write(results[i])
-			if err != nil {
-				log.Printf("写入失败: %v", err)
-				return err
-			}
-			if flusher != nil {
-				flusher.Flush()
-			}
-		}
+		}()
 	}
 
-	log.Printf("下载完成")
+	// writer：严格按顺序，谁就绪就立刻发出去
+	var written int64
+	for i := 0; i < total; i++ {
+		select {
+		case <-done[i]:
+		case <-ctx.Done():
+			cancelFetch()
+			log.Printf("请求被取消，已发送 %d 字节", written)
+			return ctx.Err()
+		}
+
+		if errs[i] != nil {
+			cancelFetch()
+			log.Printf("❌ %v", errs[i])
+			return errs[i]
+		}
+		data := results[i]
+		if data == nil {
+			// 被取消时槽位可能为空
+			cancelFetch()
+			return fmt.Errorf("数据块 %d 缺失", i)
+		}
+
+		n, werr := w.Write(data)
+		written += int64(n)
+		// 及时释放，避免整窗数据堆在内存里
+		results[i] = nil
+		if werr != nil {
+			cancelFetch()
+			log.Printf("写入失败: %v", werr)
+			return werr
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+		atomic.StoreInt64(&writeCursor, int64(i))
+	}
+
+	cancelFetch()
+	wg.Wait()
+	log.Printf("下载完成，发送 %d 字节", written)
 	return nil
 }
 
@@ -199,11 +253,11 @@ func (p *Player) Play(w http.ResponseWriter, ctx context.Context) error {
 func (p *Player) downloadFirst(w http.ResponseWriter, ctx context.Context) (int64, int64, error) {
 	start, end := p.start, p.end
 	if end <= 0 {
-		// 原版这里取 100 字节做试探。但播放器发 "Range: bytes=0-" 或不带 Range 时
-		// 就会走到这里，于是首块只有 100 字节 —— 后续分块一旦失败，
-		// 播放器就只拿到 100 字节，直接报容器解析失败。
-		// 改成取一个完整分片，保证首块本身就够解析文件头。
-		end = p.chunkSize
+		// 这里只用来「探测总长度 + 尽快回响应头」，取小一点。
+		// 取满 1MB 会让响应头延迟 6~8 秒（光鸭限速下单块就要这么久），
+		// ExoPlayer 等不到响应头就超时。
+		// 真正的数据由后面的流式循环补齐，所以首块小不影响完整性。
+		end = probeSize
 	} else {
 		// Range 结束位是闭区间，这里转成内部处理更方便的开区间。
 		end += 1
@@ -394,6 +448,11 @@ func (p *Player) doChunk(ctx context.Context, target string, start, end int64) (
 // 不能一次承诺整个文件：那样中途任一分块失败就会断流，
 // 播放器拿到的字节少于 Content-Length，直接报容器解析失败。
 const windowSize int64 = 24 * 1024 * 1024
+
+// 首块探测大小。只为拿到 Content-Range 里的总长度并尽快回响应头，
+// 取太大会让响应头迟迟不返回（光鸭限速下 1MB 要 6~8 秒），播放器直接超时。
+// 64KB 足够拿到响应头，且 mkv/mp4 的头部信息通常也在这个范围内。
+const probeSize int64 = 64 * 1024
 
 var crRegex = regexp.MustCompile(`bytes\s+(\d+)-(\d+)/(\d+)`)
 var seRegex = regexp.MustCompile(`bytes=(\d+)-(\d*)`)
