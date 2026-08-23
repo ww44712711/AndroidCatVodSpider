@@ -370,6 +370,17 @@ func (p *Player) downloadFirst(w http.ResponseWriter, ctx context.Context) (int6
 	// 明确告知总长与可 Range，播放器据此做 seek
 	h.Set("Accept-Ranges", "bytes")
 	h.Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+
+	// Content-Type 固定成 video/mp4，与内置 Java 代理保持一致。
+	//
+	// 为什么不透传源站的值：光鸭对 mkv 返回 video/x-matroska，
+	// 而 ExoPlayer/Media3 拿到它之后既没走 MatroskaExtractor，
+	// 也没成功嗅探，日志里报 format=application/octet-stream
+	// originalFormat=null，最终 ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED。
+	// 内置 Java 代理一直固定回 video/mp4，实测能正常播放 —— 
+	// exo 会据此走通用嗅探路径，按实际字节判断容器（mkv 也能正确识别）。
+	h.Set("Content-Type", "video/mp4")
+
 	w.WriteHeader(status)
 
 	_, err = w.Write(chunk)
