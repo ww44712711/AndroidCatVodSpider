@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -196,24 +197,55 @@ func (p *Player) Play(w http.ResponseWriter, ctx context.Context) error {
 func (p *Player) downloadFirst(w http.ResponseWriter, ctx context.Context) (int64, int64, error) {
 	start, end := p.start, p.end
 	if end <= 0 {
-		// 客户端没有给出明确结束位置时，先试探取一个较小首块。
-		end = 100
+		// 原版这里取 100 字节做试探。但播放器发 "Range: bytes=0-" 或不带 Range 时
+		// 就会走到这里，于是首块只有 100 字节 —— 后续分块一旦失败，
+		// 播放器就只拿到 100 字节，直接报容器解析失败。
+		// 改成取一个完整分片，保证首块本身就够解析文件头。
+		end = p.chunkSize
 	} else {
 		// Range 结束位是闭区间，这里转成内部处理更方便的开区间。
 		end += 1
 	}
 	end = start + min(end, p.chunkSize)
 
-	chunk, header, status, err := p.downloadChunk(ctx, start, end, 3)
+	// 首块决定整个响应能否建立，必须多试几轮。
+	// 光鸭限流时会连续几次都回 JSON 占位，重试次数给足才能穿过去。
+	chunk, header, status, err := p.downloadChunk(ctx, start, end, 8)
 	if err != nil {
 		return 0, 0, err
 	}
 
-	matches := crRegex.FindStringSubmatch(header.Get("Content-Range"))
-	if len(matches) != 4 {
+	// 光鸭 CDN 会**间歇性忽略 Range 头**，直接回 200 且不带 Content-Range
+	// （实测连续 6 次里出现 1 次）。原实现此时直接报错放弃，
+	// 于是播放器收到 200 + 零字节，一直卡在 PREPARING 并每 15 秒重试。
+	// 这里改为多重回退推断总长度，拿不到再报错。
+	var totalLength int64
+	if matches := crRegex.FindStringSubmatch(header.Get("Content-Range")); len(matches) == 4 {
+		totalLength, _ = strconv.ParseInt(matches[3], 10, 64)
+	}
+	if totalLength <= 0 && status == http.StatusOK {
+		// 200 表示服务端返回了整个文件，Content-Length 就是总长
+		if cl := header.Get("Content-Length"); cl != "" {
+			totalLength, _ = strconv.ParseInt(cl, 10, 64)
+		}
+	}
+	if totalLength <= 0 {
+		// 再试一次带 Range 的探测，换一条链
+		if _, h2, _, e2 := p.downloadChunk(ctx, 0, 1, 3); e2 == nil {
+			if m2 := crRegex.FindStringSubmatch(h2.Get("Content-Range")); len(m2) == 4 {
+				totalLength, _ = strconv.ParseInt(m2[3], 10, 64)
+			}
+		}
+	}
+	if totalLength <= 0 {
 		return 0, 0, errors.New("未获取到文件总大小")
 	}
-	totalLength, _ := strconv.ParseInt(matches[3], 10, 64)
+
+	// 服务端忽略了 Range 直接回整个文件时，首块里的数据远多于我们要的，
+	// 截断到请求区间，避免后续按 chunk 拼接时字节错位。
+	if status == http.StatusOK && int64(len(chunk)) > end-start {
+		chunk = chunk[:end-start]
+	}
 
 	if p.end <= 0 {
 		// 没指定结束位置时，默认拉取到源文件尾部。
@@ -278,8 +310,14 @@ func (p *Player) downloadChunk(ctx context.Context, start, end int64, maxRetries
 		}
 		lastErr = err
 		if retry < maxRetries-1 {
+			// 退避上限 600ms —— 首块重试次数给到 8 次，
+			// 若用线性退避总耗时会到 14 秒，播放器早就超时了。
+			backoff := time.Duration(retry+1) * 150 * time.Millisecond
+			if backoff > 600*time.Millisecond {
+				backoff = 600 * time.Millisecond
+			}
 			select {
-			case <-time.After(time.Duration(retry+1) * 400 * time.Millisecond):
+			case <-time.After(backoff):
 			case <-ctx.Done():
 				return nil, nil, -1, ctx.Err()
 			}
@@ -303,11 +341,32 @@ func (p *Player) doChunk(ctx context.Context, target string, start, end int64) (
 	}
 	defer resp.Body.Close()
 
+	// 光鸭 CDN 在限流/异常时会返回一个 43 字节的 JSON 占位响应
+	// {"code":0,"msg":"光鸭云盘为您服务"}，HTTP 200 且 Content-Type: application/json。
+	// 这不是视频数据，必须当失败处理并换一条链重试；
+	// 原实现把它当正常数据收下，于是播放器拿到 43 字节垃圾，
+	// 报 CONTAINER_UNSUPPORTED 并每 15 秒重试。
+	if ct := resp.Header.Get("Content-Type"); strings.Contains(strings.ToLower(ct), "json") {
+		return nil, nil, -1, fmt.Errorf("源站返回 JSON 占位响应(限流?)，需换链重试")
+	}
+
 	// 某些源站即使带了 Range 也会直接返回 200，这里一并兼容。
 	if resp.StatusCode == 206 || resp.StatusCode == 200 {
+		want := end - start
 		data, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return nil, nil, -1, err
+		}
+		// 光鸭会间歇性忽略 Range 回 200 + 整个文件。
+		// 分块阶段拿到这种响应必须截取自己那一段，否则拼接后字节全错位。
+		if resp.StatusCode == 200 && start > 0 {
+			if int64(len(data)) > start+want {
+				data = data[start : start+want]
+			} else if int64(len(data)) > start {
+				data = data[start:]
+			}
+		} else if int64(len(data)) > want && want > 0 {
+			data = data[:want]
 		}
 		return data, resp.Header, resp.StatusCode, nil
 	}

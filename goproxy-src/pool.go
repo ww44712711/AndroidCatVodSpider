@@ -10,6 +10,7 @@ package main
 import (
 	"strings"
 	"sync"
+	"time"
 )
 
 // URLPool 负责在多条等价下载链之间轮转，并限制单条链的并发数。
@@ -54,14 +55,26 @@ func ParseURLs(raw string) []string {
 // Acquire 取一条当前并发未满的链，并原子占位。
 // 挑选与占位必须在同一把锁内完成 —— 分成两步会让多个协程同时选中同一条链，
 // 一起冲过 perURL 上限，退化成单链多并发的慢速模式（实测吞吐掉到 1/4）。
+//
+// 重要：这里**绝不能无限等待**。
+// 线程数可能大于池子容量（perURL × 链数），例如 thread=8 / perURL=2 / 4 条链，
+// 容量刚好 8，一旦有链暂时不可用，多余的协程就会卡在 cond.Wait() 上；
+// 而调用方在等这些协程返回，于是整个响应死锁 —— 客户端收到 200 但零字节。
+// 所以超时后退化为「轮转返回一条链，不占位」，宁可略微超并发也不能卡死。
 func (p *URLPool) Acquire() (int, string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	deadline := time.Now().Add(3 * time.Second)
 	for {
 		if p.closed {
-			return -1, ""
+			// 池已关闭也要给出可用链，否则在途协程会拿到空 URL 而失败
+			return -1, p.anyLocked()
 		}
 		n := len(p.urls)
+		if n == 0 {
+			return -1, ""
+		}
 		for i := 0; i < n; i++ {
 			idx := (p.next + i) % n
 			if p.perURL <= 0 || p.active[idx] < p.perURL {
@@ -70,9 +83,34 @@ func (p *URLPool) Acquire() (int, string) {
 				return idx, p.urls[idx]
 			}
 		}
-		// 全部占满，等有人释放
-		p.cond.Wait()
+		if time.Now().After(deadline) {
+			// 超时兜底：不占位直接给一条，避免死锁
+			idx := p.next % n
+			p.next = (idx + 1) % n
+			return -1, p.urls[idx]
+		}
+		p.waitTimeout()
 	}
+}
+
+// anyLocked 在已持锁的前提下返回任意一条链。
+func (p *URLPool) anyLocked() string {
+	if len(p.urls) == 0 {
+		return ""
+	}
+	idx := p.next % len(p.urls)
+	p.next = (idx + 1) % len(p.urls)
+	return p.urls[idx]
+}
+
+// waitTimeout 带超时的条件等待。
+// sync.Cond 本身不支持超时，用一个定时 Broadcast 的协程唤醒。
+func (p *URLPool) waitTimeout() {
+	timer := time.AfterFunc(200*time.Millisecond, func() {
+		p.cond.Broadcast()
+	})
+	p.cond.Wait()
+	timer.Stop()
 }
 
 // Release 归还占位。

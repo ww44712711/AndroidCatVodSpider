@@ -48,7 +48,12 @@ func main() {
 		}
 
 		player := NewPlayer(r.Header, t, c, url, perURL)
-		defer player.pool.Close()
+		if player.pool.Size() == 0 {
+			http.Error(w, "url 参数无有效链接", http.StatusBadRequest)
+			return
+		}
+		// 不在这里 defer Close()：Play() 返回时可能还有在途下载协程，
+		// 提前关闭会让它们拿不到链而失败。池随请求一起被 GC 回收即可。
 
 		// 这里不做 panic 恢复，尽量把错误按正常流程返回并记录日志。
 		if err := player.Play(w, r.Context()); err != nil {
