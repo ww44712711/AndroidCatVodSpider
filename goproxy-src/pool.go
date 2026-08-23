@@ -16,7 +16,6 @@ import (
 // URLPool 负责在多条等价下载链之间轮转，并限制单条链的并发数。
 type URLPool struct {
 	mu      sync.Mutex
-	cond    *sync.Cond
 	urls    []string
 	active  []int
 	perURL  int
@@ -31,7 +30,6 @@ func NewURLPool(urls []string, perURL int) *URLPool {
 		active: make([]int, len(urls)),
 		perURL: perURL,
 	}
-	p.cond = sync.NewCond(&p.mu)
 	return p
 }
 
@@ -62,17 +60,24 @@ func ParseURLs(raw string) []string {
 // 而调用方在等这些协程返回，于是整个响应死锁 —— 客户端收到 200 但零字节。
 // 所以超时后退化为「轮转返回一条链，不占位」，宁可略微超并发也不能卡死。
 func (p *URLPool) Acquire() (int, string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
+	// 关键：**绝不在锁内等待**。
+	//
+	// 之前用 defer Unlock + cond.Wait 在锁里等空位，而 Release 也要抢同一把锁，
+	// 8 个 worker 高频 Acquire/Release 时全部串行化在这把 mutex 上，
+	// 实际并行度远低于设定值 —— 实测 8 秒只交付 0.5~2MB（应有 25MB）。
+	// 内置 Java 代理是「拿不到就立刻返回，睡一小会儿再试」，没有锁内等待，
+	// 这里改成同样的做法。
 	deadline := time.Now().Add(3 * time.Second)
 	for {
+		p.mu.Lock()
 		if p.closed {
-			// 池已关闭也要给出可用链，否则在途协程会拿到空 URL 而失败
-			return -1, p.anyLocked()
+			s := p.anyLocked()
+			p.mu.Unlock()
+			return -1, s
 		}
 		n := len(p.urls)
 		if n == 0 {
+			p.mu.Unlock()
 			return -1, ""
 		}
 		for i := 0; i < n; i++ {
@@ -80,16 +85,22 @@ func (p *URLPool) Acquire() (int, string) {
 			if p.perURL <= 0 || p.active[idx] < p.perURL {
 				p.active[idx]++
 				p.next = (idx + 1) % n
-				return idx, p.urls[idx]
+				url := p.urls[idx]
+				p.mu.Unlock()
+				return idx, url
 			}
 		}
+		// 全占满：超时就不占位直接给一条，避免调用方卡死
 		if time.Now().After(deadline) {
-			// 超时兜底：不占位直接给一条，避免死锁
 			idx := p.next % n
 			p.next = (idx + 1) % n
-			return -1, p.urls[idx]
+			url := p.urls[idx]
+			p.mu.Unlock()
+			return -1, url
 		}
-		p.waitTimeout()
+		p.mu.Unlock()
+		// 锁外短睡，让 Release 能顺畅拿到锁
+		time.Sleep(15 * time.Millisecond)
 	}
 }
 
@@ -103,16 +114,6 @@ func (p *URLPool) anyLocked() string {
 	return p.urls[idx]
 }
 
-// waitTimeout 带超时的条件等待。
-// sync.Cond 本身不支持超时，用一个定时 Broadcast 的协程唤醒。
-func (p *URLPool) waitTimeout() {
-	timer := time.AfterFunc(200*time.Millisecond, func() {
-		p.cond.Broadcast()
-	})
-	p.cond.Wait()
-	timer.Stop()
-}
-
 // Release 归还占位。
 func (p *URLPool) Release(idx int) {
 	if idx < 0 {
@@ -123,7 +124,6 @@ func (p *URLPool) Release(idx int) {
 		p.active[idx]--
 	}
 	p.mu.Unlock()
-	p.cond.Broadcast()
 }
 
 // Size 返回池中链数量。
@@ -138,5 +138,21 @@ func (p *URLPool) Close() {
 	p.mu.Lock()
 	p.closed = true
 	p.mu.Unlock()
-	p.cond.Broadcast()
+}
+
+// sizeKey 由链集合派生出稳定的缓存键。
+// 签名链每次都不同，但同一文件的 fid 参数一致，用它做键。
+func sizeKey(urls []string) string {
+	if len(urls) == 0 {
+		return ""
+	}
+	u := urls[0]
+	if i := strings.Index(u, "fid="); i >= 0 {
+		rest := u[i+4:]
+		if j := strings.IndexByte(rest, '&'); j > 0 {
+			return rest[:j]
+		}
+		return rest
+	}
+	return u
 }

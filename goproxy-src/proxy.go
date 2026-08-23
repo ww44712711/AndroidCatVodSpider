@@ -33,6 +33,8 @@ type Player struct {
 	// pool 为多条等价下载链的轮转池。
 	// 光鸭这类按签名链限速的源，必须多链并行才能叠加吞吐。
 	pool *URLPool
+	// cacheKey 用于复用同一文件的总长度，避免每次请求都发探测请求
+	cacheKey string
 }
 
 // NewPlayer 根据上游请求头和代理参数创建一个下载器实例。
@@ -78,6 +80,7 @@ func NewPlayer(header http.Header, thread, chunkSizeKB int, url string, perURL i
 		chunkSize: int64(chunkSizeKB) * 1024,
 		url:       urls[0],
 		pool:      NewURLPool(urls, perURL),
+		cacheKey:  sizeKey(urls),
 	}
 }
 
@@ -192,6 +195,7 @@ func (p *Player) Play(w http.ResponseWriter, ctx context.Context) error {
 				}
 
 				pc := pieces[idx]
+				tFetch := time.Now()
 				var data []byte
 				var err error
 				// 每块独立超时，避免某块永久卡住
@@ -215,6 +219,12 @@ func (p *Player) Play(w http.ResponseWriter, ctx context.Context) error {
 					errs[idx] = fmt.Errorf("数据块 %d (%d-%d) 下载失败: %w", idx, pc.start, pc.end-1, err)
 				} else {
 					results[idx] = data
+					// 记录慢块，用于判断瓶颈在源站还是代理
+					if d := time.Since(tFetch); d > 2*time.Second {
+						log.Printf("  慢块 %d: %dKB 用了 %.1fs (%.2f MB/s)",
+							idx, len(data)/1024, d.Seconds(),
+							float64(len(data))/1048576/d.Seconds())
+					}
 				}
 				close(done[idx])
 			}
@@ -223,13 +233,24 @@ func (p *Player) Play(w http.ResponseWriter, ctx context.Context) error {
 
 	// writer：严格按顺序，谁就绪就立刻发出去
 	var written int64
+	tStart := time.Now()
+	var waitTotal time.Duration
 	for i := 0; i < total; i++ {
+		tw := time.Now()
 		select {
 		case <-done[i]:
 		case <-ctx.Done():
 			cancelFetch()
-			log.Printf("请求被取消，已发送 %d 字节", written)
+			log.Printf("请求被取消，已发送 %d 字节 (等待累计 %.1fs / 总 %.1fs)",
+				written, waitTotal.Seconds(), time.Since(tStart).Seconds())
 			return ctx.Err()
+		}
+		wait := time.Since(tw)
+		waitTotal += wait
+		// 只在明显卡顿时记录，避免日志爆量
+		if wait > 500*time.Millisecond {
+			log.Printf("  writer 等块 %d 耗时 %.1fs (已发 %.1fMB)",
+				i, wait.Seconds(), float64(written)/1048576)
 		}
 
 		if errs[i] != nil {
@@ -261,13 +282,21 @@ func (p *Player) Play(w http.ResponseWriter, ctx context.Context) error {
 
 	cancelFetch()
 	wg.Wait()
-	log.Printf("下载完成，发送 %d 字节", written)
+	el := time.Since(tStart).Seconds()
+	log.Printf("下载完成 %.1fMB / %.1fs = %.2f MB/s (writer 等待占 %.1fs)",
+		float64(written)/1048576, el, float64(written)/1048576/el, waitTotal.Seconds())
 	return nil
 }
 
 // downloadFirst 下载首块数据，并根据源站返回的 Content-Range 确定完整文件大小。
 // 这个阶段还负责把响应头回写给客户端。
 func (p *Player) downloadFirst(w http.ResponseWriter, ctx context.Context) (int64, int64, error) {
+	// 总长度已知就跳过探测请求，直接写响应头开始流式传输。
+	// 这能把 seek / 续传的响应头延迟从 1.6~1.9 秒降到几乎为 0，
+	// 把宝贵的时间留给真实数据 —— exo 判超时只给约 3.4 秒。
+	if total := cachedSize(p.cacheKey); total > 0 {
+		return p.fastHeader(w, total)
+	}
 	start, end := p.start, p.end
 	if end <= 0 {
 		// 这里只用来「探测总长度 + 尽快回响应头」，取小一点。
@@ -313,6 +342,7 @@ func (p *Player) downloadFirst(w http.ResponseWriter, ctx context.Context) (int6
 	if totalLength <= 0 {
 		return 0, 0, errors.New("未获取到文件总大小")
 	}
+	putCachedSize(p.cacheKey, totalLength)
 
 	// 服务端忽略了 Range 直接回整个文件时，首块里的数据远多于我们要的，
 	// 截断到请求区间，避免后续按 chunk 拼接时字节错位。
@@ -389,6 +419,37 @@ func (p *Player) downloadFirst(w http.ResponseWriter, ctx context.Context) (int6
 	}
 
 	return start + int64(len(chunk)), end, nil
+}
+
+// fastHeader 在总长度已缓存时直接写响应头，不发探测请求。
+// 返回值语义与 downloadFirst 一致：(下一个待下载位置, 本窗口结束位, err)
+func (p *Player) fastHeader(w http.ResponseWriter, totalLength int64) (int64, int64, error) {
+	start := p.start
+	if start >= totalLength {
+		return 0, 0, errors.New("range 超出文件范围")
+	}
+	var end int64
+	if p.end <= 0 {
+		end = start + windowSize - 1
+	} else {
+		end = p.end
+		if end-start+1 > windowSize {
+			end = start + windowSize - 1
+		}
+	}
+	if end > totalLength-1 {
+		end = totalLength - 1
+	}
+
+	h := w.Header()
+	h.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, totalLength))
+	h.Set("Accept-Ranges", "bytes")
+	h.Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+	// 与内置 Java 代理一致：固定 video/mp4，让 exo 走通用嗅探
+	h.Set("Content-Type", "video/mp4")
+	w.WriteHeader(http.StatusPartialContent)
+	// 一个字节都还没发，流式循环从 start 开始补
+	return start, end, nil
 }
 
 // downloadChunk 负责下载一个指定字节区间。
@@ -470,6 +531,37 @@ func (p *Player) doChunk(ctx context.Context, target string, start, end int64) (
 	}
 
 	return nil, nil, -1, fmt.Errorf("状态码: %d", resp.StatusCode)
+}
+
+// 文件总长度缓存。
+//
+// 播放器每次 seek / 续传都会重新请求，而 downloadFirst 每次都要发一个
+// 探测请求去读 Content-Range 才能知道总长 —— 光鸭限速下这一步就要 1.6~1.9 秒，
+// 而 exo 从 prepare 到判超时只有约 3.4 秒，探测吃掉一半时间，
+// 留给真实数据的窗口不到 1.5 秒，于是每次都来不及。
+// 内置 Java 代理的 getSignedUrls/getFileSize 都带缓存，第二次几乎瞬时。
+// 这里按「链集合」缓存总长度，同一文件的后续请求直接复用。
+var (
+	sizeCacheMu sync.Mutex
+	sizeCache   = map[string]int64{}
+)
+
+func cachedSize(key string) int64 {
+	sizeCacheMu.Lock()
+	defer sizeCacheMu.Unlock()
+	return sizeCache[key]
+}
+
+func putCachedSize(key string, size int64) {
+	if size <= 0 {
+		return
+	}
+	sizeCacheMu.Lock()
+	defer sizeCacheMu.Unlock()
+	if len(sizeCache) > 64 {
+		sizeCache = map[string]int64{}
+	}
+	sizeCache[key] = size
 }
 
 // 单次响应最多吐这么多。
