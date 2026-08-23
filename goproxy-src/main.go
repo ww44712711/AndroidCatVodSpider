@@ -63,9 +63,22 @@ func main() {
 	})
 
 	// 健康检查接口，方便上层轮询代理是否正常可用。
+	// build 字段让 Java 侧能判断「5575 上跑的是不是最新版」——
+	// app 重启后原来的 Process 引用就丢了，那个进程变成孤儿进程，
+	// 光靠比对文件无法知道它的版本，必须让它自报。
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"status": "healthy", "type": "go", "port": %d, "timestamp": "%s"}`, 5575, time.Now().Format(time.RFC3339))
+		fmt.Fprintf(w, `{"status": "healthy", "type": "go", "port": %d, "build": "%s", "timestamp": "%s"}`,
+			5575, BuildID, time.Now().Format(time.RFC3339))
+	})
+
+	// 让上层可以主动要求老进程退出，解决孤儿进程占端口的问题。
+	http.HandleFunc("/quit", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "bye")
+		go func() {
+			time.Sleep(200 * time.Millisecond)
+			os.Exit(0)
+		}()
 	})
 
 	log.SetOutput(os.Stdout)
