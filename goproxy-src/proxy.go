@@ -88,9 +88,11 @@ func (p *Player) Play(w http.ResponseWriter, ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	fileSize := e + 1
-	log.Printf("文件大小: %d MB, 线程: %d, 块大小: %d KB",
-		fileSize/1024/1024, p.thread, p.chunkSize/1024)
+	// e 是本次响应窗口的结束位（不是整个文件的结尾），
+	// 所以这里是「本窗口的上界」，循环到它为止即可正常结束响应。
+	windowEnd := e + 1
+	log.Printf("本次窗口: %d-%d (%d MB), 线程: %d, 块大小: %d KB",
+		s, e, (windowEnd-s)/1024/1024, p.thread, p.chunkSize/1024)
 
 	flusher, _ := w.(http.Flusher)
 	if flusher != nil {
@@ -100,7 +102,7 @@ func (p *Player) Play(w http.ResponseWriter, ctx context.Context) error {
 	results := make([][]byte, p.thread)
 	var wg sync.WaitGroup
 
-	for start := s; start < fileSize; start += int64(p.chunkSize) * int64(p.thread) {
+	for start := s; start < windowEnd; start += int64(p.chunkSize) * int64(p.thread) {
 		// 上层如果主动断开连接，这里尽快停止后续下载。
 		select {
 		case <-ctx.Done():
@@ -116,11 +118,11 @@ func (p *Player) Play(w http.ResponseWriter, ctx context.Context) error {
 		for i := 0; i < p.thread; i++ {
 			chunkStart := start + int64(i)*p.chunkSize
 			chunkEnd := chunkStart + p.chunkSize
-			if chunkStart >= fileSize {
+			if chunkStart >= windowEnd {
 				break
 			}
-			if chunkEnd > fileSize {
-				chunkEnd = fileSize
+			if chunkEnd > windowEnd {
+				chunkEnd = windowEnd
 			}
 
 			results[i] = nil
@@ -248,10 +250,24 @@ func (p *Player) downloadFirst(w http.ResponseWriter, ctx context.Context) (int6
 	}
 
 	if p.end <= 0 {
-		// 没指定结束位置时，默认拉取到源文件尾部。
-		end = totalLength - 1
+		// 原版这里直接拉到文件尾部，于是 Content-Length 声明成整个文件
+		// （实测 2.4GB），一次响应必须连续传完 2.4GB。
+		// 中途任何一个分块彻底失败就断流，播放器收到的字节少于声明值，
+		// 报 CONTAINER_UNSUPPORTED / MANIFEST_MALFORMED。
+		// 改为每次只承诺一个窗口，传完正常结束，播放器自己发下一个 Range 续传。
+		// 这也是内置 Java 代理能稳定播放而 Go 版不行的关键差异。
+		end = start + windowSize - 1
+		if end > totalLength-1 {
+			end = totalLength - 1
+		}
 	} else {
 		end = p.end
+		if end-start+1 > windowSize {
+			end = start + windowSize - 1
+		}
+		if end > totalLength-1 {
+			end = totalLength - 1
+		}
 	}
 
 	h := w.Header()
@@ -373,6 +389,11 @@ func (p *Player) doChunk(ctx context.Context, target string, start, end int64) (
 
 	return nil, nil, -1, fmt.Errorf("状态码: %d", resp.StatusCode)
 }
+
+// 单次响应最多吐这么多。
+// 不能一次承诺整个文件：那样中途任一分块失败就会断流，
+// 播放器拿到的字节少于 Content-Length，直接报容器解析失败。
+const windowSize int64 = 24 * 1024 * 1024
 
 var crRegex = regexp.MustCompile(`bytes\s+(\d+)-(\d+)/(\d+)`)
 var seRegex = regexp.MustCompile(`bytes=(\d+)-(\d*)`)
