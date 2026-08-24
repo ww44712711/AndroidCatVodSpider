@@ -47,7 +47,10 @@ func main() {
 			}
 		}
 
-		player := NewPlayer(r.Header, t, c, url, perURL)
+		// ua/referer/cookie 由调用方通过查询参数指定，优先于播放器自带的头。
+		// PikPak 等网盘要求特定 UA，播放器发来的 AndroidXMedia3 会被源站拒绝。
+		player := NewPlayerWithHeaders(r.Header, t, c, url, perURL,
+			params.Get("ua"), params.Get("referer"), params.Get("cookie"))
 		if player.pool.Size() == 0 {
 			http.Error(w, "url 参数无有效链接", http.StatusBadRequest)
 			return

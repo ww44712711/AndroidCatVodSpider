@@ -40,6 +40,26 @@ type Player struct {
 // 这里只透传和目标源站关系最强的几个请求头，避免把无关头信息带过去。
 //
 // url 支持逗号分隔的多条等价链；perURL 限制单条链的并发数（<=0 表示不限）。
+// NewPlayerWithHeaders 允许调用方通过查询参数指定要透传给源站的请求头。
+//
+// 为什么需要：PikPak 这类网盘要求特定的 UA/Referer，而播放器发来的
+// User-Agent 是它自己的（AndroidXMedia3/...），直接转发会被源站拒绝。
+// 光鸭是在 Java 侧把头编进 URL，这里统一支持。
+func NewPlayerWithHeaders(header http.Header, thread, chunkSizeKB int, url string,
+	perURL int, ua, referer, cookie string) *Player {
+	p := NewPlayer(header, thread, chunkSizeKB, url, perURL)
+	if ua != "" {
+		p.header.Set("User-Agent", ua)
+	}
+	if referer != "" {
+		p.header.Set("Referer", referer)
+	}
+	if cookie != "" {
+		p.header.Set("Cookie", cookie)
+	}
+	return p
+}
+
 func NewPlayer(header http.Header, thread, chunkSizeKB int, url string, perURL int) *Player {
 	h := http.Header{}
 	for _, key := range []string{"User-Agent", "Cookie", "Referer"} {
